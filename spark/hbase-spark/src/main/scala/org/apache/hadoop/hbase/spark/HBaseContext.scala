@@ -17,39 +17,40 @@
 
 package org.apache.hadoop.hbase.spark
 
+import java.io._
 import java.net.InetSocketAddress
 import java.util
 import java.util.UUID
-import javax.management.openmbean.KeyAlreadyExistsException
 
-import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.hadoop.hbase.fs.HFileSystem
+import javax.management.openmbean.KeyAlreadyExistsException
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileAlreadyExistsException, FileSystem, Path}
+import org.apache.hadoop.hbase.PartitionerType.PartitionerType
 import org.apache.hadoop.hbase._
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.fs.HFileSystem
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
 import org.apache.hadoop.hbase.io.compress.Compression
 import org.apache.hadoop.hbase.io.compress.Compression.Algorithm
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding
-import org.apache.hadoop.hbase.io.hfile.{HFile, CacheConfig, HFileContextBuilder, HFileWriterImpl}
-import org.apache.hadoop.hbase.regionserver.{HStore, HStoreFile, StoreFileWriter, BloomType}
+import org.apache.hadoop.hbase.io.hfile.{CacheConfig, HFile, HFileContextBuilder, HFileWriterImpl}
+import org.apache.hadoop.hbase.mapreduce.{IdentityTableMapper, TableInputFormat, TableMapReduceUtil}
+import org.apache.hadoop.hbase.regionserver.{BloomType, HStore, HStoreFile, StoreFileWriter}
+import org.apache.hadoop.hbase.spark.HBaseRDDFunctions._
 import org.apache.hadoop.hbase.util.Bytes
 import org.apache.hadoop.mapred.JobConf
+import org.apache.hadoop.mapreduce.Job
+import org.apache.hadoop.security.UserGroupInformation
+import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.RDD
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.hbase.spark.HBaseRDDFunctions._
-import org.apache.hadoop.hbase.client._
-import scala.reflect.ClassTag
-import org.apache.spark.{SerializableWritable, SparkContext}
-import org.apache.hadoop.hbase.mapreduce.{TableMapReduceUtil,
-TableInputFormat, IdentityTableMapper}
-import org.apache.hadoop.hbase.io.ImmutableBytesWritable
-import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.streaming.dstream.DStream
-import java.io._
-import org.apache.hadoop.security.UserGroupInformation
-import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod
-import org.apache.hadoop.fs.{Path, FileAlreadyExistsException, FileSystem}
+import org.apache.spark.{Partitioner, SerializableWritable, SparkContext}
+import org.apache.yetus.audience.InterfaceAudience
+
 import scala.collection.mutable
+import scala.reflect.ClassTag
 
 /**
   * HBaseContext is a façade for HBase operations
@@ -609,7 +610,8 @@ class HBaseContext(@transient val sc: SparkContext,
                   util.Map[Array[Byte], FamilyHFileWriteOptions] =
                   new util.HashMap[Array[Byte], FamilyHFileWriteOptions],
                   compactionExclude: Boolean = false,
-                  maxSize:Long = HConstants.DEFAULT_MAX_FILE_SIZE):
+                  maxSize:Long = HConstants.DEFAULT_MAX_FILE_SIZE,
+                  partitioner: PartitionerType = PartitionerType.DefaultPartitioner):
   Unit = {
     val stagingPath = new Path(stagingDir)
     val fs = stagingPath.getFileSystem(config)
@@ -641,7 +643,12 @@ class HBaseContext(@transient val sc: SparkContext,
       }
 
       val regionSplitPartitioner =
-        new BulkLoadPartitioner(startKeys)
+        partitioner match {
+          case PartitionerType.SaltPartitioner =>
+            new SaltBulkLoadPartitioner(startKeys)
+          case PartitionerType.DefaultPartitioner =>
+            new BulkLoadPartitioner(startKeys)
+        }
 
       //This is where all the magic happens
       //Here we are going to do the following things
@@ -735,16 +742,17 @@ class HBaseContext(@transient val sc: SparkContext,
    * @param maxSize                        Max size for the HFiles before they roll
    * @tparam T                             The Type of values in the original RDD
    */
-  def bulkLoadThinRows[T](rdd:RDD[T],
-                  tableName: TableName,
-                  mapFunction: (T) =>
-                    (ByteArrayWrapper, FamiliesQualifiersValues),
-                  stagingDir:String,
-                  familyHFileWriteOptionsMap:
-                  util.Map[Array[Byte], FamilyHFileWriteOptions] =
-                  new util.HashMap[Array[Byte], FamilyHFileWriteOptions],
-                  compactionExclude: Boolean = false,
-                  maxSize:Long = HConstants.DEFAULT_MAX_FILE_SIZE):
+  def bulkLoadThinRows[T](rdd: RDD[T],
+                          tableName: TableName,
+                          mapFunction: (T) =>
+                            (ByteArrayWrapper, FamiliesQualifiersValues),
+                          stagingDir: String,
+                          familyHFileWriteOptionsMap:
+                          util.Map[Array[Byte], FamilyHFileWriteOptions] =
+                          new util.HashMap[Array[Byte], FamilyHFileWriteOptions],
+                          compactionExclude: Boolean = false,
+                          maxSize: Long = HConstants.DEFAULT_MAX_FILE_SIZE,
+                          partitioner: PartitionerType = PartitionerType.DefaultPartitioner):
   Unit = {
     val stagingPath = new Path(stagingDir)
     val fs = stagingPath.getFileSystem(config)
@@ -776,7 +784,12 @@ class HBaseContext(@transient val sc: SparkContext,
       }
 
       val regionSplitPartitioner =
-        new BulkLoadPartitioner(startKeys)
+        partitioner match {
+          case PartitionerType.SaltPartitioner =>
+            new SaltBulkLoadPartitioner(startKeys)
+          case PartitionerType.DefaultPartitioner =>
+            new BulkLoadPartitioner(startKeys)
+        }
 
       //This is where all the magic happens
       //Here we are going to do the following things
@@ -1042,7 +1055,7 @@ class HBaseContext(@transient val sc: SparkContext,
    */
   private def rollWriters(fs:FileSystem,
                           writerMap:mutable.HashMap[ByteArrayWrapper, WriterLength],
-                  regionSplitPartitioner: BulkLoadPartitioner,
+                  regionSplitPartitioner: Partitioner,
                   previousRow: Array[Byte],
                   compactionExclude: Boolean): Unit = {
     writerMap.values.foreach( wl => {
@@ -1070,7 +1083,7 @@ class HBaseContext(@transient val sc: SparkContext,
    */
   private def closeHFileWriter(fs:FileSystem,
                                w: StoreFileWriter,
-                               regionSplitPartitioner: BulkLoadPartitioner,
+                               regionSplitPartitioner: Partitioner,
                                previousRow: Array[Byte],
                                compactionExclude: Boolean): Unit = {
     if (w != null) {
